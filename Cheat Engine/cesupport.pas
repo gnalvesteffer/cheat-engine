@@ -47,9 +47,16 @@ end;
 
 var adwindow: TADWindow;
 
+{ FPC 3.2.2 compatibility: ExtractFileNameWithoutExt added in 3.3.1 }
+function ExtractFileNameWithoutExt(const FileName: string): string;
+
 implementation
 
-
+{ FPC 3.2.2 compatibility: ExtractFileNameWithoutExt added in 3.3.1 }
+function ExtractFileNameWithoutExt(const FileName: string): string;
+begin
+  Result := ChangeFileExt(ExtractFileName(FileName), '');
+end;
 
 procedure TADWindow.setUserUrl(url: string);
 begin

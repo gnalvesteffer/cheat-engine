@@ -1,45 +1,96 @@
+{$mode delphi}
 unit LuaAI;
 
-{AI debugging co-pilot Lua module
- Exposes functions to gather debugging context and interact with AI APIs.
- Functions:
-   ai_readMemory(addr, size) -> string (hex bytes)
-   ai_getRegisters() -> table of register name/value pairs
-   ai_getCurrentRegister() -> {name, value, description}
-   ai_disassemble(addr, count) -> array of disasm strings
-   ai_getThreadInfo() -> table of thread info
-   ai_getBreakpoints() -> table of breakpoint info
-   ai_getModuleList() -> table of module info
-   ai_getStackTrace() -> array of stack frame strings
-   ai_getProcessInfo() -> {pid, name, architecture, bits}
-   ai_findPointer(address) -> table of pointer paths
-   ai_getMemorySections() -> table of memory regions
-   ai_gatherContext() -> comprehensive debug context string
-   ai_call(url, body) -> string (HTTP POST response)
-   ai_setKey(key) -> nil (set API key in settings)
-   ai_getKey() -> string
-   ai_chat(message) -> string (conversational AI response)
-   ai_chatStream(message) -> callback-based streaming
-}
-
-{$mode delphi}
+(* AI debugging co-pilot Lua module
+   Exposes functions to gather debugging context and interact with AI APIs. *)
 
 interface
 
 uses
-  Classes, SysUtils, lua, lauxlib, lualib;
+  Classes, SysUtils, lua, lauxlib, lualib, symbolhandlerstructs;
 
 procedure initializeLuaAI;
+function  buildContextString: string;
+function  getProcessName: string;
+procedure saveLLMSettings;
+
+var
+  g_apiKey: string;
+  g_apiBaseUrl: string;
+  g_apiModel: string;
+  g_apiMaxTokens: integer;
+  g_apiTemperature: double;
 
 implementation
 
 uses
-  debughelper, ProcessHandlerUnit,
+  debughelper, ProcessHandlerUnit, debuggertypedefinitions, processlist,
   commontypedefs, NewKernelHandler, disassembler, symbolhandler,
   globals, debugeventhandler, breakpointtypedef,
-  stacktrace2, LuaInternet, rescanhelper,
-  LCLProc, Windows, CEFuncProc, dialogs, JSONFunctions,
-  contexthandler, LazUTF8;
+  stacktrace2, LuaInternet, rescanhelper, LuaHandler,
+  LCLProc, Windows, CEFuncProc, dialogs,
+  contexthandler, LazUTF8, IniFiles,
+  cesupport;
+
+{-----------------------------------------------}
+{ Global configuration }
+{-----------------------------------------------}
+
+var
+  g_llmSettingsPath: string = '';
+
+{-----------------------------------------------}
+{ Helper: get settings path }
+{-----------------------------------------------}
+
+function getSettingsPath: string;
+var
+  appData: array[0..MAX_PATH] of Char;
+  len: DWORD;
+begin
+  FillChar(appData, SizeOf(appData), 0);
+  len := GetEnvironmentVariable('APPDATA', appData, Length(appData));
+  if len > 0 then
+    Result := string(appData)
+  else
+    Result := ExtractFilePath(ParamStr(0));
+  Result := Result + 'Cheat Engine\LLMSettings.ini';
+end;
+
+procedure loadLLMSettings;
+var
+  ini: TIniFile;
+begin
+  g_llmSettingsPath := getSettingsPath;
+  ini := TIniFile.Create(g_llmSettingsPath);
+  try
+    g_apiKey := ini.ReadString('LLM', 'APIKey', '');
+    g_apiBaseUrl := ini.ReadString('LLM', 'BaseUrl', 'https://api.openai.com/v1/chat/completions');
+    g_apiModel := ini.ReadString('LLM', 'Model', 'gpt-4o-mini');
+    g_apiMaxTokens := ini.ReadInteger('LLM', 'MaxTokens', 2048);
+    g_apiTemperature := ini.ReadFloat('LLM', 'Temperature', 0.2);
+  finally
+    ini.Free;
+  end;
+end;
+
+procedure saveLLMSettings;
+var
+  ini: TIniFile;
+begin
+  if g_llmSettingsPath = '' then
+    g_llmSettingsPath := getSettingsPath;
+  ini := TIniFile.Create(g_llmSettingsPath);
+  try
+    ini.WriteString('LLM', 'APIKey', g_apiKey);
+    ini.WriteString('LLM', 'BaseUrl', g_apiBaseUrl);
+    ini.WriteString('LLM', 'Model', g_apiModel);
+    ini.WriteInteger('LLM', 'MaxTokens', g_apiMaxTokens);
+    ini.WriteFloat('LLM', 'Temperature', g_apiTemperature);
+  finally
+    ini.Free;
+  end;
+end;
 
 {-----------------------------------------------}
 { Helper: safe string to Lua }
@@ -52,6 +103,23 @@ begin
   else
     lua_pushstring(L, PChar(s));
   Result := 1;
+end;
+
+function luaToPtrUint(L: Plua_State; index: integer): ptruint;
+begin
+  Result := ptruint(lua_tointeger(L, index));
+end;
+
+{ lua_tostring returns PChar (AnsiString in FPC Lua bindings) }
+function luaToString(L: Plua_State; index: integer): string;
+var
+  s: PChar;
+begin
+  s := PChar(lua_tostring(L, index));
+  if s <> nil then
+    Result := string(s)
+  else
+    Result := '';
 end;
 
 {-----------------------------------------------}
@@ -68,6 +136,31 @@ end;
 function getContextHandler: TContextInfo;
 begin
   Result := getBestContextHandler;
+end;
+
+{-----------------------------------------------}
+{ Helper: get process name from handle }
+{-----------------------------------------------}
+
+function getProcessName: string;
+var
+  h: THandle;
+  name: array[0..MAX_PATH] of Char;
+  size: DWORD;
+begin
+  Result := 'None';
+  if processhandler.processid = 0 then Exit;
+  h := OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, processhandler.processid);
+  if h <> 0 then
+  try
+    size := Length(name);
+    if QueryFullProcessImageName(h, 0, name, @size) then
+      Result := ExtractFileName(name)
+    else
+      Result := Format('Process_%d', [processhandler.processid]);
+  finally
+    CloseHandle(h);
+  end;
 end;
 
 {-----------------------------------------------}
@@ -91,7 +184,7 @@ begin
       Exit;
     end;
 
-    addr := lua_tounsignedinteger(L, 1);
+    addr := luaToPtrUint(L, 1);
     size := lua_tointeger(L, 2);
 
     if size < 1 then size := 1;
@@ -145,12 +238,13 @@ begin
     gpr := ch.getGeneralPurposeRegisters;
 
     lua_newtable(L);
-    for i := 0 to gpr^.count - 1 do
-    begin
-      lua_pushstring(L, PChar(gpr^[i].name));
-      lua_pushinteger(L, gpr^[i].getValue(ctx));
-      lua_settable(L, -3);
-    end;
+    if gpr <> nil then
+      for i := 0 to length(gpr^) - 1 do
+      begin
+        lua_pushstring(L, PChar(gpr^[i].name));
+        lua_pushinteger(L, gpr^[i].getValue(ctx));
+        lua_settable(L, -3);
+      end;
 
     lua_pushstring(L, 'architecture');
     if processhandler.is64bit then
@@ -208,7 +302,6 @@ begin
 
     d := TDisassembler.Create;
     try
-      d.setProcessHandler(processhandler);
       desc := d.disassemble(ipAddr);
     finally
       d.Free;
@@ -256,7 +349,7 @@ begin
       Exit;
     end;
 
-    addr := lua_tounsignedinteger(L, 1);
+    addr := luaToPtrUint(L, 1);
     count := 5;
     if lua_gettop(L) >= 2 then
       count := lua_tointeger(L, 2);
@@ -266,7 +359,6 @@ begin
 
     d := TDisassembler.Create;
     try
-      d.setProcessHandler(processhandler);
       lua_newtable(L);
       for i := 1 to count do
       begin
@@ -294,26 +386,24 @@ end;
 
 function ai_getThreadInfo(L: Plua_State): integer; cdecl;
 var
-  threadlist: TDwordArray;
+  tl: TList;
   i: integer;
   thread: TDebugThreadHandler;
 begin
   Result := 0;
   try
-    if (debuggerthread = nil) or (processhandler.pid = 0) then
+    if (debuggerthread = nil) or (processhandler.processid = 0) then
     begin
       lua_pushstring(L, 'No process attached.');
       Exit;
     end;
 
-    getThreadList(threadlist);
-
-    lua_newtable(L);
-    for i := 0 to length(threadlist) - 1 do
-    begin
-      thread := debuggerthread.getDebugThreadHanderFromThreadID(threadlist[i]);
-      if thread <> nil then
+    tl := debuggerthread.lockThreadlist;
+    try
+      lua_newtable(L);
+      for i := 0 to tl.Count - 1 do
       begin
+        thread := TDebugThreadHandler(tl[i]);
         lua_pushinteger(L, i + 1);
         lua_newtable(L);
 
@@ -335,6 +425,8 @@ begin
 
         lua_settable(L, -3);
       end;
+    finally
+      debuggerthread.unlockThreadlist;
     end;
 
   except
@@ -389,12 +481,11 @@ begin
 
         lua_pushstring(L, 'method');
         case bp.breakpointMethod of
-          bpmSoftware: lua_pushstring(L, 'software');
-          bpmHardware: lua_pushstring(L, 'hardware');
+          bpmInt3: lua_pushstring(L, 'int3');
           bpmDebugRegister: lua_pushstring(L, 'debugRegister');
-          bpmDBVM: lua_pushstring(L, 'DBVM');
-          bpmPageProtect: lua_pushstring(L, 'pageProtect');
           bpmException: lua_pushstring(L, 'exception');
+          bpmDBVM: lua_pushstring(L, 'DBVM');
+          bpmDBVMNative: lua_pushstring(L, 'DBVMNative');
           bpmGDB: lua_pushstring(L, 'GDB');
         else
           lua_pushstring(L, 'unknown');
@@ -403,18 +494,9 @@ begin
 
         lua_pushstring(L, 'trigger');
         case bp.breakpointTrigger of
-          bptOnExecute: lua_pushstring(L, 'execute');
-          bptOnAccess: lua_pushstring(L, 'access');
-          bptOnWrite: lua_pushstring(L, 'write');
-          bptOnRead: lua_pushstring(L, 'read');
-          bptOnReadOrWrite: lua_pushstring(L, 'readWrite');
-          bptOnException: lua_pushstring(L, 'exception');
-          bptOnModuleLoad: lua_pushstring(L, 'moduleLoad');
-          bptOnThreadCreate: lua_pushstring(L, 'threadCreate');
-          bptOnThreadExit: lua_pushstring(L, 'threadExit');
-          bptOnProcessCreate: lua_pushstring(L, 'processCreate');
-          bptOnProcessExit: lua_pushstring(L, 'processExit');
-          bptOnUnhandledException: lua_pushstring(L, 'unhandledException');
+          bptExecute: lua_pushstring(L, 'execute');
+          bptAccess: lua_pushstring(L, 'access');
+          bptWrite: lua_pushstring(L, 'write');
         else
           lua_pushstring(L, 'unknown');
         end;
@@ -439,41 +521,49 @@ end;
 
 function ai_getModuleList(L: Plua_State): integer; cdecl;
 var
+  modList: TStringList;
   i: integer;
   name: string;
-  base, sz: ptruint;
+  mi: TModuleInfo;
 begin
   Result := 0;
   try
-    if processhandler.pid = 0 then
+    if processhandler.processid = 0 then
     begin
       lua_pushstring(L, 'No process attached.');
       Exit;
     end;
 
-    symhandler.initmoduleinformation;
-
-    lua_newtable(L);
-    for i := 0 to symhandler.moduleList.Count - 1 do
-    begin
-      lua_pushinteger(L, i + 1);
+    modList := TStringList.Create;
+    try
+      symhandler.getModuleList(modList);
       lua_newtable(L);
+      for i := 0 to modList.Count - 1 do
+      begin
+        name := modList[i];
 
-      symhandler.getModuleInformation(i, name, base, sz);
+        lua_pushinteger(L, i + 1);
+        lua_newtable(L);
 
-      lua_pushstring(L, 'name');
-      lua_pushstring(L, PChar(name));
-      lua_settable(L, -3);
+        lua_pushstring(L, 'name');
+        lua_pushstring(L, PChar(name));
+        lua_settable(L, -3);
 
-      lua_pushstring(L, 'base');
-      lua_pushinteger(L, base);
-      lua_settable(L, -3);
+        if symhandler.getmodulebyname(name, mi) then
+        begin
+          lua_pushstring(L, 'base');
+          lua_pushinteger(L, mi.baseaddress);
+          lua_settable(L, -3);
 
-      lua_pushstring(L, 'size');
-      lua_pushinteger(L, sz);
-      lua_settable(L, -3);
+          lua_pushstring(L, 'size');
+          lua_pushinteger(L, mi.basesize);
+          lua_settable(L, -3);
+        end;
 
-      lua_settable(L, -3);
+        lua_settable(L, -3);
+      end;
+    finally
+      modList.Free;
     end;
 
   except
@@ -492,6 +582,15 @@ end;
 function ai_getStackTrace(L: Plua_State): integer; cdecl;
 var
   ctx: pointer;
+  j: integer;
+  trace: TStringList;
+  ch: TContextInfo;
+  ipReg: PContextElement_register;
+  espReg: PContextElement_register;
+  ebpReg: PContextElement_register;
+  eip: ptruint;
+  esp: ptruint;
+  ebp: ptruint;
 begin
   Result := 0;
   try
@@ -502,7 +601,46 @@ begin
       Exit;
     end;
 
-    ce_stacktrace(L, ctx, processhandler, nil);
+    ch := getContextHandler;
+    if ch = nil then
+    begin
+      lua_pushstring(L, 'Context handler not available.');
+      Exit;
+    end;
+
+    { Get EIP, ESP, EBP from context }
+    ipReg := ch.InstructionPointerRegister;
+    espReg := ch.StackPointerRegister;
+    ebpReg := ch.FramePointerRegister;
+
+    if (ipReg = nil) or (espReg = nil) then
+    begin
+      lua_pushstring(L, 'Stack registers not available.');
+      Exit;
+    end;
+
+    eip := ipReg.getValue(ctx);
+    esp := espReg.getValue(ctx);
+    if ebpReg <> nil then
+      ebp := ebpReg.getValue(ctx)
+    else
+      ebp := 0;
+
+    trace := TStringList.Create;
+    try
+      { ce_stacktrace(esp, ebp, eip, stack, size, trace, force4byte, showmodules, nosystem, maxdepth, refaddr, refname) }
+      ce_stacktrace(esp, ebp, eip, nil, 0, trace, True, True, False, 50, 0, '');
+
+      lua_newtable(L);
+      for j := 0 to trace.Count - 1 do
+      begin
+        lua_pushinteger(L, j + 1);
+        lua_pushstring(L, PChar(trace[j]));
+        lua_settable(L, -3);
+      end;
+    finally
+      trace.Free;
+    end;
 
   except
     on e: Exception do
@@ -521,14 +659,20 @@ function ai_getProcessInfo(L: Plua_State): integer; cdecl;
 begin
   Result := 0;
   try
+    if processhandler.processid = 0 then
+    begin
+      lua_pushstring(L, 'No process attached.');
+      Exit;
+    end;
+
     lua_newtable(L);
 
     lua_pushstring(L, 'pid');
-    lua_pushinteger(L, processhandler.pid);
+    lua_pushinteger(L, processhandler.processid);
     lua_settable(L, -3);
 
     lua_pushstring(L, 'name');
-    lua_pushstring(L, PChar(processhandler.Processname));
+    lua_pushstring(L, PChar(getProcessName));
     lua_settable(L, -3);
 
     lua_pushstring(L, 'architecture');
@@ -555,39 +699,31 @@ begin
 end;
 
 {-----------------------------------------------}
-{ ai_findPointer - Find pointer path to address }
+{ ai_findPointer - Find pointer paths (stub) }
 {-----------------------------------------------}
 
 function ai_findPointer(L: Plua_State): integer; cdecl;
 var
   addr: ptruint;
-  helper: TRescanHelper;
-  maxDepth: integer;
 begin
   Result := 0;
   try
     if lua_gettop(L) < 1 then
     begin
-      lua_pushstring(L, 'Usage: ai_findPointer(address, [maxdepth=4])');
+      lua_pushstring(L, 'Usage: ai_findPointer(address)');
       Exit;
     end;
 
-    addr := lua_tounsignedinteger(L, 1);
-    maxDepth := 4;
-    if lua_gettop(L) >= 2 then
-      maxDepth := lua_tointeger(L, 2);
-    if (maxDepth < 1) or (maxDepth > 8) then maxDepth := 4;
-
-    helper := TRescanHelper.Create(nil);
-    try
-      helper.addScanEntry(addr, svtInteger, '4', '0', False, False, False);
-      helper.setMaxDepth(maxDepth);
-      helper.setFoundList(nil);
-      helper.performScan;
-      lua_pushboolean(L, helper.found);
-    finally
-      helper.Free;
+    addr := luaToPtrUint(L, 1);
+    if processhandler.processid = 0 then
+    begin
+      lua_pushstring(L, 'No process attached.');
+      Exit;
     end;
+
+    { Pointer scanning is a complex GUI-driven feature in CE.
+      Expose a Lua-level scan via rescanhelper instead. }
+    lua_pushstring(L, PChar('Pointer scanning at 0x' + IntToHex(addr, 1) + '. Use the Pointer Scanner GUI for full functionality.'));
 
   except
     on e: Exception do
@@ -604,45 +740,43 @@ end;
 
 function ai_getMemorySections(L: Plua_State): integer; cdecl;
 var
-  regions: TStringList;
-  region: TMemoryRegionInformation;
+  helper: TRescanHelper;
+  regions: TMemoryRegions;
   i: integer;
-  addr: ptruint;
-  protection: dword;
-  regionType: integer;
 begin
   Result := 0;
   try
-    if processhandler.pid = 0 then
+    if processhandler.processid = 0 then
     begin
       lua_pushstring(L, 'No process attached.');
       Exit;
     end;
 
-    lua_newtable(L);
-    addr := 0;
-    while true do
-    begin
-      region := getMemoryRegionInformation(addr, True);
-      if region.address = 0 then Break;
-
-      lua_pushinteger(L, lua_gettable(L, -1) + 1);
+    helper := TRescanHelper.Create;
+    try
+      regions := helper.getMemoryRegions;
       lua_newtable(L);
+      for i := 0 to length(regions) - 1 do
+      begin
+        lua_pushinteger(L, i + 1);
+        lua_newtable(L);
 
-      lua_pushstring(L, 'start');
-      lua_pushinteger(L, region.address);
-      lua_settable(L, -3);
+        lua_pushstring(L, 'start');
+        lua_pushinteger(L, regions[i].BaseAddress);
+        lua_settable(L, -3);
 
-      lua_pushstring(L, 'size');
-      lua_pushinteger(L, region.regionSize);
-      lua_settable(L, -3);
+        lua_pushstring(L, 'size');
+        lua_pushinteger(L, regions[i].MemorySize);
+        lua_settable(L, -3);
 
-      lua_pushstring(L, 'protection');
-      lua_pushinteger(L, region.protection);
-      lua_settable(L, -3);
+        lua_pushstring(L, 'ischild');
+        lua_pushboolean(L, regions[i].IsChild);
+        lua_settable(L, -3);
 
-      lua_settable(L, -3);
-      addr := region.address + region.regionSize;
+        lua_settable(L, -3);
+      end;
+    finally
+      helper.Free;
     end;
 
   except
@@ -655,7 +789,7 @@ begin
 end;
 
 {-----------------------------------------------}
-{ buildContextString - Helper for AI context }
+{ buildContextString - Comprehensive debug context }
 {-----------------------------------------------}
 
 function buildContextString: string;
@@ -665,117 +799,123 @@ var
   ipReg: PContextElement_register;
   ipAddr: ptruint;
   d: TDisassembler;
-  regs, disasm, bpStr, modStr: string;
-  i: integer;
-  gpr: PContextElementRegisterList;
-  addrs: TAddressArray;
-  bp: PBreakpoint;
-  modName: string;
-  modBase, modSize: ptruint;
+  regs: string;
+  disasm: string;
   archStr: string;
+  addrs: TAddressArray;
+  gpr: PContextElementRegisterList;
+  i: integer;
+  bp: PBreakpoint;
+  bpList: string;
+  modList: TStringList;
+  modListStr: string;
+  thread: TDebugThreadHandler;
+  tl: TList;
+  threadStr: string;
+  processName: string;
 begin
   Result := '';
   regs := '';
   disasm := '';
-  bpStr := '';
-  modStr := '';
-
+  bpList := '';
+  modListStr := '';
+  threadStr := '';
   archStr := 'x86';
-  if processhandler.is64bit then archStr := 'x64';
 
   ctx := getCurrentContext;
-  if ctx <> nil then
+  ch := getContextHandler;
+
+  if processhandler.processid <> 0 then
   begin
-    ch := getContextHandler;
-    if ch <> nil then
-    begin
-      { Registers }
-      gpr := ch.getGeneralPurposeRegisters;
-      for i := 0 to gpr^.count - 1 do
+    if processhandler.is64bit then
+      archStr := 'x64';
+    processName := getProcessName;
+  end
+  else
+    processName := 'None';
+
+  if (ctx <> nil) and (ch <> nil) then
+  begin
+    { Registers }
+    gpr := ch.getGeneralPurposeRegisters;
+    if gpr <> nil then
+      for i := 0 to length(gpr^) - 1 do
         regs := regs + Format('  %s: 0x%s%s', [gpr^[i].name, IntToHex(gpr^[i].getValue(ctx), 1), #13#10]);
 
-      { Instruction pointer + disassembly }
-      ipReg := ch.InstructionPointerRegister;
-      if ipReg <> nil then
-      begin
-        ipAddr := ipReg.getValue(ctx);
-        d := TDisassembler.Create;
-        try
-          d.setProcessHandler(processhandler);
-          disasm := '  ' + ipReg.name + ': 0x' + IntToHex(ipAddr, 1) + ' -> ' + d.disassemble(ipAddr) + #13#10;
-        finally
-          d.Free;
-        end;
+    { Instruction pointer + disassembly }
+    ipReg := ch.InstructionPointerRegister;
+    if ipReg <> nil then
+    begin
+      ipAddr := ipReg.getValue(ctx);
+      d := TDisassembler.Create;
+      try
+        disasm := '  ' + ipReg.name + ': 0x' + IntToHex(ipAddr, 1) + ' -> ' + d.disassemble(ipAddr) + #13#10;
+      finally
+        d.Free;
       end;
     end;
   end;
 
   { Breakpoints }
-  if (debuggerthread <> nil) then
+  if debuggerthread <> nil then
   begin
     debuggerthread.getBreakpointAddresses(addrs);
     for i := 0 to length(addrs) - 1 do
     begin
       bp := debuggerthread.isBreakpoint(addrs[i], 0, True);
       if bp <> nil then
-        bpStr := bpStr + Format('  0x%s active=%s%s', [IntToHex(bp.address, 1), BoolToStr(bp.active, True), #13#10]);
+        bpList := bpList + Format('  0x%s (active=%s)%s', [IntToHex(bp.address, 1), BoolToStr(bp.active, True), #13#10]);
     end;
-    if bpStr = '' then
-      bpStr := '  (none)' + #13#10;
   end;
 
-  { Modules - main module + first 5 }
-  if processhandler.pid <> 0 then
+  { Modules }
+  if processhandler.processid <> 0 then
   begin
-    symhandler.initmoduleinformation;
-    for i := 0 to symhandler.moduleList.Count - 1 do
-    begin
-      symhandler.getModuleInformation(i, modName, modBase, modSize);
-      modStr := modStr + Format('  %s: 0x%s (%s bytes)%s', [modName, IntToHex(modBase, 1), IntToStr(modSize), #13#10]);
+    modList := TStringList.Create;
+    try
+      symhandler.getModuleList(modList);
+      for i := 0 to modList.Count - 1 do
+        modListStr := modListStr + '  ' + modList[i] + #13#10;
+    finally
+      modList.Free;
+    end;
+  end;
+
+  { Threads }
+  if (debuggerthread <> nil) and (processhandler.processid <> 0) then
+  begin
+    tl := debuggerthread.lockThreadlist;
+    try
+      for i := 0 to tl.Count - 1 do
+      begin
+        thread := TDebugThreadHandler(tl[i]);
+        threadStr := threadStr + Format('  Thread 0x%s (suspended=%s)%s', [IntToHex(thread.ThreadId, 1), BoolToStr(thread.isSuspended, True), #13#10]);
+      end;
+    finally
+      debuggerthread.unlockThreadlist;
     end;
   end;
 
   Result := Format(
-    '=== Process ===%s' +
-    '  PID: %s%s' +
-    '  Name: %s%s' +
-    '  Arch: %s%s' +
-    '  State: %s%s' +
-    '=== Registers ===%s' +
-    '%s' +
-    '=== Disassembly ===%s' +
-    '%s' +
-    '=== Breakpoints ===%s' +
-    '%s' +
-    '=== Modules ===%s' +
-    '%s',
-    [#13#10, IntToStr(processhandler.pid), #13#10,
-     processhandler.Processname, #13#10,
-     archStr, #13#10,
-     BoolToStr(debuggerthread <> nil, 'debugged', 'running'), #13#10,
-     #13#10, regs, #13#10, disasm, #13#10, bpStr, #13#10, modStr]
-  );
+    'Process: %s (PID: %d, Arch: %s)%s' +
+    'Registers:%s%s' +
+    'Disassembly:%s%s' +
+    'Breakpoints:%s%s' +
+    'Modules:%s%s' +
+    'Threads:%s%s',
+    [processName, processhandler.processid, archStr, #13#10,
+     #13#10, regs, #13#10, disasm, #13#10, #13#10, bpList, #13#10,
+     #13#10, modListStr, #13#10, #13#10, threadStr]);
 end;
 
 {-----------------------------------------------}
-{ ai_gatherContext - Comprehensive context string }
+{ ai_gatherContext - Comprehensive debug context }
 {-----------------------------------------------}
 
 function ai_gatherContext(L: Plua_State): integer; cdecl;
-var
-  contextStr: string;
 begin
   Result := 0;
-  try
-    contextStr := buildContextString;
-    lua_pushstring(L, PChar(contextStr));
-  except
-    on e: Exception do
-    begin
-      lua_pushstring(L, PChar('Error: ' + e.Message));
-    end;
-  end;
-  Result := 1;
+  lua_pushstring(L, PChar(buildContextString));
 end;
 
 {-----------------------------------------------}
@@ -784,10 +924,11 @@ end;
 
 function ai_call(L: Plua_State): integer; cdecl;
 var
-  url, body: string;
-  response: string;
-  http: TLuaInternet;
-  headers: TStringList;
+  url: string;
+  body: string;
+  http: TWinInternet;
+  memStream: TMemoryStream;
+  response: AnsiString;
 begin
   Result := 0;
   try
@@ -797,18 +938,22 @@ begin
       Exit;
     end;
 
-    url := Lua_ToString(L, 1);
-    body := Lua_ToString(L, 2);
+    url := luaToString(L, 1);
+    body := luaToString(L, 2);
 
-    http := TLuaInternet.Create(nil);
+    http := TWinInternet.Create('AI');
     try
-      headers := TStringList.Create;
+      http.Header := 'Content-Type: application/json';
+      memStream := TMemoryStream.Create;
       try
-        headers.Add('Content-Type: application/json');
-        response := http.post(url, body, headers);
+        http.postURL(url, body, memStream);
+        memStream.Position := 0;
+        SetLength(response, memStream.Size);
+        if memStream.Size > 0 then
+          memStream.Read(PAnsiChar(response)^, memStream.Size);
         lua_pushstring(L, PChar(response));
       finally
-        headers.Free;
+        memStream.Free;
       end;
     finally
       http.Free;
@@ -824,49 +969,147 @@ begin
 end;
 
 {-----------------------------------------------}
-{ ai_setKey / ai_getKey - API key management }
+{ ai_setKey - Set API key }
 {-----------------------------------------------}
-
-var
-  g_aiKey: string = '';
-  g_aiBaseUrl: string = 'https://api.openai.com/v1/chat/completions';
-  g_aiModel: string = 'gpt-4o-mini';
 
 function ai_setKey(L: Plua_State): integer; cdecl;
 begin
   Result := 0;
-  if lua_gettop(L) >= 1 then
-    g_aiKey := Lua_ToString(L, 1);
+  if lua_gettop(L) < 1 then
+  begin
+    lua_pushstring(L, 'Usage: ai_setKey("your-api-key")');
+    Exit;
+  end;
+  g_apiKey := luaToString(L, 1);
+  saveLLMSettings;
+  lua_pushnil(L);
+  Result := 1;
 end;
 
-function ai_setBaseUrl(L: Plua_State): integer; cdecl;
-begin
-  Result := 0;
-  if lua_gettop(L) >= 1 then
-    g_aiBaseUrl := Lua_ToString(L, 1);
-end;
-
-function ai_setModel(L: Plua_State): integer; cdecl;
-begin
-  Result := 0;
-  if lua_gettop(L) >= 1 then
-    g_aiModel := Lua_ToString(L, 1);
-end;
+{-----------------------------------------------}
+{ ai_getKey - Get API key }
+{-----------------------------------------------}
 
 function ai_getKey(L: Plua_State): integer; cdecl;
 begin
   Result := 0;
-  if g_aiKey = '' then
-    lua_pushnil(L)
-  else
-    lua_pushstring(L, PChar(g_aiKey));
+  lua_pushstring(L, PChar(g_apiKey));
   Result := 1;
 end;
+
+{-----------------------------------------------}
+{ ai_setBaseUrl - Set API base URL }
+{-----------------------------------------------}
+
+function ai_setBaseUrl(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  if lua_gettop(L) < 1 then
+  begin
+    lua_pushstring(L, 'Usage: ai_setBaseUrl("https://api.openai.com/v1/chat/completions")');
+    Exit;
+  end;
+  g_apiBaseUrl := luaToString(L, 1);
+  saveLLMSettings;
+  lua_pushnil(L);
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getBaseUrl - Get base URL }
+{-----------------------------------------------}
 
 function ai_getBaseUrl(L: Plua_State): integer; cdecl;
 begin
   Result := 0;
-  lua_pushstring(L, PChar(g_aiBaseUrl));
+  lua_pushstring(L, PChar(g_apiBaseUrl));
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_setModel - Set AI model name }
+{-----------------------------------------------}
+
+function ai_setModel(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  if lua_gettop(L) < 1 then
+  begin
+    lua_pushstring(L, 'Usage: ai_setModel("gpt-4o")');
+    Exit;
+  end;
+  g_apiModel := luaToString(L, 1);
+  saveLLMSettings;
+  lua_pushnil(L);
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getModel - Get model name }
+{-----------------------------------------------}
+
+function ai_getModel(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  lua_pushstring(L, PChar(g_apiModel));
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_setMaxTokens - Set max tokens }
+{-----------------------------------------------}
+
+function ai_setMaxTokens(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  if lua_gettop(L) < 1 then
+  begin
+    lua_pushstring(L, 'Usage: ai_setMaxTokens(2048)');
+    Exit;
+  end;
+  g_apiMaxTokens := lua_tointeger(L, 1);
+  saveLLMSettings;
+  lua_pushnil(L);
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getMaxTokens - Get max tokens }
+{-----------------------------------------------}
+
+function ai_getMaxTokens(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  lua_pushinteger(L, g_apiMaxTokens);
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_setTemperature - Set temperature }
+{-----------------------------------------------}
+
+function ai_setTemperature(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  if lua_gettop(L) < 1 then
+  begin
+    lua_pushstring(L, 'Usage: ai_setTemperature(0.2)');
+    Exit;
+  end;
+  g_apiTemperature := lua_tonumber(L, 1);
+  saveLLMSettings;
+  lua_pushnil(L);
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getTemperature - Get temperature }
+{-----------------------------------------------}
+
+function ai_getTemperature(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  lua_pushnumber(L, g_apiTemperature);
   Result := 1;
 end;
 
@@ -879,10 +1122,14 @@ var
   message: string;
   contextStr: string;
   jsonBody: string;
-  response: string;
-  http: TLuaInternet;
-  headers: TStringList;
-  systemPrompt: string;
+  response: AnsiString;
+  http: TWinInternet;
+  postResult: boolean;
+  memStream: TMemoryStream;
+  escapedMessage: string;
+  authHeader: AnsiString;
+  systemPrompt: AnsiString;
+  jsonMsgs: AnsiString;
 begin
   Result := 0;
   try
@@ -892,42 +1139,48 @@ begin
       Exit;
     end;
 
-    if g_aiKey = '' then
+    if g_apiKey = '' then
     begin
-      lua_pushstring(L, 'No API key set. Use ai_setKey("your-key") first.');
+      lua_pushstring(L, 'No API key set. Use ai_setKey("your-key") or Tools > AI Chat > LLM Settings.');
       Exit;
     end;
 
-    message := Lua_ToString(L, 1);
+    message := luaToString(L, 1);
     contextStr := buildContextString;
 
     systemPrompt := 'You are an expert reverse engineering assistant embedded in Cheat Engine. ' +
       'You help analyze debugged processes, disassembly, and memory. ' +
-      'The current debug context is: ' + #13#10 + #13#10 +
+      'The current debug context is:' + #13#10 + #13#10 +
       contextStr + #13#10 +
-      'Be concise and technical. Use hex addresses where relevant. ' +
-      'If the user asks about code, explain what it does in plain terms.';
+      'Be concise and technical. Use hex addresses where relevant.';
 
-    jsonBody := Format(
-      '{"model":"%s","temperature":0.2,"max_tokens":2048,"messages":[{"role":"system","content":%s},{"role":"user","content":%s}]}',
-      [g_aiModel, AnsiQuotedStr(systemPrompt, '"'), AnsiQuotedStr(message, '"')]
-    );
+    { Build JSON body using AnsiString for UTF-8 safety }
+    jsonMsgs := Format(
+      '{"model":"%s","temperature":%.2f,"max_tokens":%d,"messages":[{"role":"system","content":"%s"},{"role":"user","content":"%s"}]}',
+      [g_apiModel, g_apiTemperature, g_apiMaxTokens,
+       AnsiString(systemPrompt), AnsiString(message)]);
 
-    http := TLuaInternet.Create(nil);
+    authHeader := AnsiString('Authorization: Bearer ' + g_apiKey);
+
+    http := TWinInternet.Create('AI');
     try
-      headers := TStringList.Create;
+      http.Header := authHeader + #13#10 + 'Content-Type: application/json';
+      memStream := TMemoryStream.Create;
       try
-        headers.Add('Authorization: Bearer ' + g_aiKey);
-        headers.Add('Content-Type: application/json');
-        response := http.post(g_aiBaseUrl, jsonBody, headers);
+        postResult := http.postURL(g_apiBaseUrl, AnsiString(jsonMsgs), memStream);
+        if postResult then
+        begin
+          memStream.Position := 0;
+          SetLength(response, memStream.Size);
+          if memStream.Size > 0 then
+            memStream.Read(PAnsiChar(response)^, memStream.Size);
+          lua_pushstring(L, PChar(response));
+        end
+        else
+          lua_pushstring(L, 'Request failed');
       finally
-        headers.Free;
+        memStream.Free;
       end;
-
-      if response <> '' then
-        lua_pushstring(L, PChar(response))
-      else
-        lua_pushstring(L, '(empty response)');
     finally
       http.Free;
     end;
@@ -942,53 +1195,87 @@ begin
 end;
 
 {-----------------------------------------------}
-{ ai_chatStream - Streaming chat via callback }
+{ ai_chatStream - Streaming AI response }
 {-----------------------------------------------}
 
 function ai_chatStream(L: Plua_State): integer; cdecl;
 var
   message: string;
-  contextStr: string;
-  jsonBody: string;
-  systemPrompt: string;
 begin
   Result := 0;
   try
-    if lua_gettop(L) < 2 then
+    if lua_gettop(L) < 1 then
     begin
-      lua_pushstring(L, 'Usage: ai_chatStream(message, callback)');
+      lua_pushstring(L, 'Usage: ai_chatStream(message)');
       Exit;
     end;
-
-    if g_aiKey = '' then
+    if g_apiKey = '' then
     begin
       lua_pushstring(L, 'No API key set. Use ai_setKey("your-key") first.');
       Exit;
     end;
-
-    message := Lua_ToString(L, 1);
-    contextStr := buildContextString;
-
-    systemPrompt := 'You are an expert reverse engineering assistant embedded in Cheat Engine. ' +
-      'Current debug context: ' + #13#10 + contextStr + #13#10 +
-      'Be concise and technical.';
-
-    jsonBody := Format(
-      '{"model":"%s","temperature":0.2,"max_tokens":2048,"stream":true,"messages":[{"role":"system","content":%s},{"role":"user","content":%s}]}',
-      [g_aiModel, AnsiQuotedStr(systemPrompt, '"'), AnsiQuotedStr(message, '"')]
-    );
-
-    { For streaming, we push the callback and body for the caller to process }
-    lua_pushstring(L, PChar(jsonBody));
-    lua_pushstring(L, PChar(g_aiBaseUrl));
-    lua_pushstring(L, PChar(g_aiKey));
+    message := luaToString(L, 1);
+    lua_pushstring(L, PChar('Streaming not yet implemented. Use ai_chat() instead.'));
   except
     on e: Exception do
     begin
       lua_pushstring(L, PChar('Error: ' + e.Message));
     end;
   end;
-  Result := 3;  { Returns jsonBody, baseUrl, apiKey for async processing }
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_testConnection - Test LLM endpoint }
+{-----------------------------------------------}
+
+function ai_testConnection(L: Plua_State): integer; cdecl;
+var
+  http: TWinInternet;
+  memStream: TMemoryStream;
+  response: AnsiString;
+  baseUrl: string;
+  authHeader: AnsiString;
+begin
+  Result := 0;
+  try
+    baseUrl := g_apiBaseUrl;
+    if lua_gettop(L) >= 1 then
+      baseUrl := luaToString(L, 1);
+
+    http := TWinInternet.Create('AI');
+    try
+      authHeader := 'Content-Type: application/json';
+      if g_apiKey <> '' then
+        authHeader := AnsiString('Authorization: Bearer ' + g_apiKey) + #13#10 + authHeader;
+      http.Header := authHeader;
+
+      memStream := TMemoryStream.Create;
+      try
+        if http.postURL(baseUrl, '{"model":"test"}', memStream) then
+        begin
+          memStream.Position := 0;
+          SetLength(response, memStream.Size);
+          if memStream.Size > 0 then
+            memStream.Read(PAnsiChar(response)^, memStream.Size);
+          lua_pushstring(L, PChar('Connected: ' + Copy(response, 1, 200)));
+        end
+        else
+          lua_pushstring(L, 'Connection failed');
+      finally
+        memStream.Free;
+      end;
+    finally
+      http.Free;
+    end;
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
 end;
 
 {-----------------------------------------------}
@@ -997,6 +1284,7 @@ end;
 
 procedure initializeLuaAI;
 begin
+  loadLLMSettings;
   lua_register(LuaVM, 'ai_readMemory', ai_readMemory);
   lua_register(LuaVM, 'ai_getRegisters', ai_getRegisters);
   lua_register(LuaVM, 'ai_getCurrentRegister', ai_getCurrentRegister);
@@ -1015,8 +1303,14 @@ begin
   lua_register(LuaVM, 'ai_setBaseUrl', ai_setBaseUrl);
   lua_register(LuaVM, 'ai_getBaseUrl', ai_getBaseUrl);
   lua_register(LuaVM, 'ai_setModel', ai_setModel);
+  lua_register(LuaVM, 'ai_getModel', ai_getModel);
+  lua_register(LuaVM, 'ai_setMaxTokens', ai_setMaxTokens);
+  lua_register(LuaVM, 'ai_getMaxTokens', ai_getMaxTokens);
+  lua_register(LuaVM, 'ai_setTemperature', ai_setTemperature);
+  lua_register(LuaVM, 'ai_getTemperature', ai_getTemperature);
   lua_register(LuaVM, 'ai_chat', ai_chat);
   lua_register(LuaVM, 'ai_chatStream', ai_chatStream);
+  lua_register(LuaVM, 'ai_testConnection', ai_testConnection);
 end;
 
 end.

@@ -1,0 +1,168 @@
+object TLLMSettingsForm: TLLMSettingsForm
+  Left = 245
+  Height = 380
+  Top = 171
+  Width = 360
+  Caption = 'LLM Settings'
+  ClientHeight = 380
+  ClientWidth = 360
+  Color = clBtnFace
+  Font.Charset = DEFAULT_CHARSET
+  Font.Color = clWindowText
+  Font.Height = -11
+  Font.Name = 'Tahoma'
+  Font.Style = []
+  OnCreate = FormCreate
+  OnShow = FormShow
+  Position = poMainFormCenter
+  object grpConnection: TGroupBox
+    Left = 10
+    Height = 160
+    Top = 10
+    Width = 340
+    Caption = 'Connection'
+    TabOrder = 0
+    object lblEndpoint: TLabel
+      Left = 10
+      Height = 15
+      Top = 25
+      Width = 53
+      Caption = 'Endpoint URL:'
+    end
+    object lblAPIKey: TLabel
+      Left = 10
+      Height = 15
+      Top = 75
+      Width = 43
+      Caption = 'API Key:'
+    end
+    object lblModel: TLabel
+      Left = 10
+      Height = 15
+      Top = 125
+      Width = 33
+      Caption = 'Model:'
+    end
+    object edtEndpoint: TEdit
+      Left = 10
+      Height = 21
+      Top = 45
+      Width = 320
+      TabOrder = 0
+      OnChange = edtEndpointChange
+      Text = 'https://api.openai.com/v1/chat/completions'
+    end
+    object edtAPIKey: TEdit
+      Left = 10
+      Height = 21
+      Top = 95
+      Width = 320
+      PasswordChar = '*'
+      TabOrder = 1
+      OnChange = edtAPIKeyChange
+    end
+    object edtModel: TEdit
+      Left = 10
+      Height = 21
+      Top = 145
+      Width = 160
+      TabOrder = 2
+      Text = 'gpt-4o-mini'
+      OnChange = edtModelChange
+    end
+  end
+  object grpParameters: TGroupBox
+    Left = 10
+    Height = 100
+    Top = 175
+    Width = 340
+    Caption = 'Parameters'
+    TabOrder = 1
+    object lblMaxTokens: TLabel
+      Left = 10
+      Height = 15
+      Top = 25
+      Width = 61
+      Caption = 'Max Tokens:'
+    end
+    object lblTemperature: TLabel
+      Left = 180
+      Height = 15
+      Top = 25
+      Width = 64
+      Caption = 'Temperature:'
+    end
+    object edtMaxTokens: TEdit
+      Left = 10
+      Height = 21
+      Top = 45
+      Width = 120
+      NumbersOnly = True
+      TabOrder = 3
+      Text = '2048'
+      OnChange = edtMaxTokensChange
+    end
+    object edtTemperature: TEdit
+      Left = 180
+      Height = 21
+      Top = 45
+      Width = 120
+      TabOrder = 4
+      Text = '0.20'
+      OnChange = edtTemperatureChange
+    end
+  end
+  object pnlStatus: TPanel
+    Left = 10
+    Height = 40
+    Top = 280
+    Width = 340
+    TabOrder = 2
+    object lblStatus: TLabel
+      Left = 5
+      Height = 15
+      Top = 12
+      Width = 330
+      Alignment = taLeftJustify
+      Caption = ''
+    end
+  end
+  object pnlButtons: TPanel
+    Left = 10
+    Height = 35
+    Top = 330
+    Width = 340
+    TabOrder = 3
+    object btnTest: TButton
+      Left = 5
+      Height = 25
+      Top = 5
+      Width = 110
+      Caption = 'Test Connection'
+      TabOrder = 0
+      OnClick = btnTestClick
+    end
+    object btnOK: TButton
+      Left = 225
+      Height = 25
+      Top = 5
+      Width = 55
+      Caption = 'OK'
+      Default = True
+      ModalResult = 1
+      TabOrder = 1
+      OnClick = btnOKClick
+    end
+    object btnCancel: TButton
+      Left = 285
+      Height = 25
+      Top = 5
+      Width = 55
+      Caption = 'Cancel'
+      Cancel = True
+      ModalResult = 2
+      TabOrder = 2
+      OnClick = btnCancelClick
+    end
+  end
+end

@@ -952,7 +952,7 @@ initialization
    {$ifdef laztrunk}
    luaclass_register(TCustomVirtualStringTree,  virtualstringtree_addMetaData);
    {$else}
-   luaclass_register(TVirtualStringTree,  virtualstringtree_addMetaData);
+   luaclass_register(TLazVirtualStringTree,  virtualstringtree_addMetaData);
    {$endif}
    luaclass_register(TVirtualTreeColumns, VirtualTreeColumns_addMetaData);
    luaclass_register(TVirtualTreeColumn,  VirtualTreeColumn_addMetaData);

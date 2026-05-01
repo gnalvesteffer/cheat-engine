@@ -17135,7 +17135,8 @@ begin
 
     initializeLuaDiagram;
     initializeLuaUltimap2;
-    initializeLuaCodeFilter;
+   initializeLuaCodeFilter;
+    initializeLuaAI;
     initializeLuaSynEdit;
     initializeLuaCustomImageList;
     initializeLuaDotNetPipe;

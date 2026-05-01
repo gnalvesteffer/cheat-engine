@@ -6,10 +6,10 @@ interface
 
 uses
   Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, ExtCtrls,
-  Buttons, ComCtrls, LCLIntf, LCLType, Registry, LuaIntf, LuaHandler,
-  LuaInternet, LuaPipeClient, LuaPipeServer, ProcessHandlerUnit,
-  debughelper, disassembler, symbolhandler, globals,
-  LuaAI, contexthandler;
+  Buttons, ComCtrls, LCLIntf, LCLType, Registry, LuaHandler,
+  LuaInternet, ProcessHandlerUnit, debughelper, disassembler, symbolhandler,
+  symbolhandlerstructs, globals, LuaAI, contexthandler, StrUtils,
+  commontypedefs, breakpointtypedef, Windows;
 
 type
   TfrmAIChat = class(TForm)
@@ -40,7 +40,6 @@ type
     FModel: string;
     FHistory: TStringList;
     FIsSending: Boolean;
-    FHttp: TLuaInternet;
     procedure LoadSettings;
     procedure SaveSettings;
     procedure AddMessage(const ASender, AText: string);
@@ -64,7 +63,6 @@ procedure TfrmAIChat.FormCreate(Sender: TObject);
 begin
   FHistory := TStringList.Create;
   FIsSending := False;
-  FHttp := TLuaInternet.Create(nil);
   LoadSettings;
   UpdateDebugState;
 
@@ -85,7 +83,6 @@ end;
 
 procedure TfrmAIChat.FormDestroy(Sender: TObject);
 begin
-  FHttp.Free;
   FHistory.Free;
 end;
 
@@ -99,9 +96,15 @@ begin
   try
     if reg.OpenKey('Software\Cheat Engine\AI', False) then
     begin
-      FAPIKey := reg.ReadString('APIKey', '');
-      FAPIUrl := reg.ReadString('APIUrl', 'https://api.openai.com/v1/chat/completions');
-      FModel := reg.ReadString('Model', 'gpt-4o-mini');
+      FAPIKey := '';
+      FAPIUrl := 'https://api.openai.com/v1/chat/completions';
+      FModel := 'gpt-4o-mini';
+      if reg.ValueExists('APIKey') then
+        FAPIKey := reg.ReadString('APIKey');
+      if reg.ValueExists('APIUrl') then
+        FAPIUrl := reg.ReadString('APIUrl');
+      if reg.ValueExists('Model') then
+        FModel := reg.ReadString('Model');
     end;
   finally
     reg.Free;
@@ -144,13 +147,13 @@ var
   d: TDisassembler;
   s: TStringList;
   gpr: PContextElementRegisterList;
-  i: integer;
+  regEntry: TContextElement_register;
+  i, j: integer;
   addrs: TAddressArray;
   bp: PBreakpoint;
-  modName: string;
-  modBase, modSize: ptrunit;
-  j: integer;
-  curAddr: ptrunit;
+  curAddr: ptruint;
+  modList: TStringList;
+  mi: TModuleInfo;
 begin
   s := TStringList.Create;
   try
@@ -158,7 +161,7 @@ begin
     s.Add('');
 
     { Process info }
-    s.Add('Process: ' + processhandler.Processname + ' (PID: ' + IntToStr(processhandler.pid) + ')');
+    s.Add('Process: ' + getProcessName + ' (PID: ' + IntToStr(processhandler.processid) + ')');
     if processhandler.is64bit then
       s.Add('Architecture: x64')
     else
@@ -181,29 +184,30 @@ begin
       if ch <> nil then
       begin
         gpr := ch.getGeneralPurposeRegisters;
-        for i := 0 to gpr^.count - 1 do
-          s.Add(Format('  %s: 0x%s', [gpr^[i].name, IntToHex(gpr^[i].getValue(ctx), 1)]));
+     for i := 0 to length(gpr^) - 1 do
+        begin
+          regEntry := gpr^[i];
+          s.Add(Format('  %s: 0x%s', [regEntry.name, IntToHex(regEntry.getValue(ctx), 1)]));
+        end;
 
         { Disassembly at IP }
         ipReg := ch.InstructionPointerRegister;
         if ipReg <> nil then
         begin
-          ipAddr := ipReg.getValue(ctx);
-          s.Add('');
-          s.Add('--- DISASSEMBLY (at ' + ipReg.name + ': 0x' + IntToHex(ipAddr, 1) + ') ---');
-          d := TDisassembler.Create;
-          try
-            d.setProcessHandler(processhandler);
-            curAddr := ipAddr;
-            for j := 0 to 9 do
-            begin
-              s.Add(Format('  0x%s: %s', [IntToHex(curAddr, 1), d.disassemble(curAddr)]));
-              curAddr := curAddr + d.GetLastInstructionSize;
-            end;
-          finally
-            d.Free;
+     ipAddr := ipReg^.getValue(ctx);
+        s.Add('');
+        s.Add('--- DISASSEMBLY (at ' + ipReg^.name + ': 0x' + IntToHex(ipAddr, 1) + ') ---');
+        d := TDisassembler.Create;
+        try
+          curAddr := ipAddr;
+          for j := 0 to 9 do
+          begin
+            s.Add(Format('  0x%s: %s', [IntToHex(curAddr, 1), d.disassemble(curAddr)]));
           end;
+        finally
+          d.Free;
         end;
+      end;
       end;
     end
     else
@@ -221,7 +225,7 @@ begin
         begin
           bp := debuggerthread.isBreakpoint(addrs[i], 0, True);
           if bp <> nil then
-            s.Add(Format('  0x%s active=%s', [IntToHex(bp.address, 1), BoolToStr(bp.active, True)]));
+            s.Add(Format('  0x%s active=%s', [IntToHex(bp^.address, 1), BoolToStr(bp^.active, True)]));
         end;
       end
       else
@@ -231,11 +235,19 @@ begin
     { Modules }
     s.Add('');
     s.Add('--- MODULES ---');
-    symhandler.initmoduleinformation;
-    for i := 0 to symhandler.moduleList.Count - 1 do
-    begin
-      symhandler.getModuleInformation(i, modName, modBase, modSize);
-      s.Add(Format('  %s: 0x%s (%s bytes)', [modName, IntToHex(modBase, 1), IntToStr(modSize)]));
+    modList := TStringList.Create;
+    try
+      symhandler.getModuleList(modList);
+      for i := 0 to modList.Count - 1 do
+      begin
+        if symhandler.getmodulebyname(modList[i], mi) then
+          s.Add(Format('  %s: 0x%s (%s bytes)',
+            [mi.modulename, IntToHex(mi.baseaddress, 1), IntToStr(mi.basesize)]))
+        else
+          s.Add('  ' + modList[i]);
+      end;
+    finally
+      modList.Free;
     end;
 
     Result := s.Text;
@@ -249,9 +261,10 @@ var
   query: string;
   jsonBody: string;
   systemPrompt: string;
-  response: string;
-  headers: TStringList;
+  response: AnsiString;
   contextStr: string;
+  memStream: TMemoryStream;
+  http: TWinInternet;
   contentStart: integer;
   content: string;
   quotePos: integer;
@@ -289,42 +302,52 @@ begin
       [FModel, AnsiQuotedStr(systemPrompt, '"'), AnsiQuotedStr(query, '"')]
     );
 
-    headers := TStringList.Create;
+    http := TWinInternet.Create('AIChat');
+    memStream := TMemoryStream.Create;
     try
-      if FAPIKey <> '' then
-        headers.Add('Authorization: Bearer ' + FAPIKey);
-      headers.Add('Content-Type: application/json');
-      headers.Add('Accept: application/json');
+      http.Header := 'Content-Type: application/json' + #13#10;
+     if FAPIKey <> '' then
+        http.Header := http.Header + 'Authorization: Bearer ' + FAPIKey + #13#10;
 
-      response := FHttp.post(FAPIUrl, jsonBody, headers);
+      if http.postURL(FAPIUrl, jsonBody, memStream) then
+      begin
+        memStream.Position := 0;
+        SetLength(response, memStream.Size);
+        if memStream.Size > 0 then
+          memStream.Read(PAnsiChar(response)^, memStream.Size);
+      end
+      else
+        response := '';
+
+      if response <> '' then
+      begin
+        try
+          { Extract the actual content from the JSON response }
+          contentStart := Pos('"content":', string(response));
+          if contentStart > 0 then
+          begin
+            content := Copy(string(response), contentStart + 10, Length(string(response)));
+            quotePos := Pos('"', content);
+            if quotePos > 0 then
+              content := Copy(content, quotePos + 1, Length(content) - quotePos - 1);
+            { Handle escaped newlines }
+            content := StringReplace(content, '\n', #13#10, [rfReplaceAll]);
+            content := StringReplace(content, '\t', '  ', [rfReplaceAll]);
+            AddMessage('AI', content);
+          end
+          else
+            AddMessage('AI', string(response));
+        except
+          AddMessage('AI', string(response));
+        end;
+      end
+      else
+        AddMessage('Error', 'Empty or failed response from API.');
+
     finally
-      headers.Free;
+      memStream.Free;
+      http.Free;
     end;
-
-    if response <> '' then
-    begin
-      try
-        { Extract the actual content from the JSON response }
-        contentStart := Pos('"content":', response);
-        if contentStart > 0 then
-        begin
-          content := Copy(response, contentStart + 10, Length(response));
-          quotePos := Pos('"', content);
-          if quotePos > 0 then
-            content := Copy(content, quotePos + 1, Length(content) - quotePos - 1);
-          { Handle escaped newlines }
-          content := StringReplace(content, '\n', #13#10, [rfReplaceAll]);
-          content := StringReplace(content, '\t', '  ', [rfReplaceAll]);
-          AddMessage('AI', content);
-        end
-        else
-          AddMessage('AI', response);
-      except
-        AddMessage('AI', response);
-      end;
-    end
-    else
-      AddMessage('Error', 'Empty response from API.');
 
   except
     on E: Exception do
@@ -389,13 +412,15 @@ begin
 end;
 
 procedure TfrmAIChat.UpdateDebugState;
+var
+  state: string;
 begin
-  if (debuggerthread <> nil) and (processhandler.pid <> 0) then
+  if (debuggerthread <> nil) and (processhandler.processid <> 0) then
   begin
-    var state := 'RUNNING';
+    state := 'RUNNING';
     if debuggerthread.isWaitingToContinue then state := 'BROKEN';
     LabelStatus.Caption := Format('Debugging: %s (PID: %d) - %s',
-      [processhandler.Processname, processhandler.pid, state]);
+      [getProcessName, processhandler.processid, state]);
   end
   else
   begin

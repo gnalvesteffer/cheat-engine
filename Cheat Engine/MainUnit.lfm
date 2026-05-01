@@ -2650,7 +2650,17 @@ object MainForm: TMainForm
     end
     object miAIChat: TMenuItem
       Caption = 'AI &Chat'
-      OnClick = miAIChatClick
+      object miAIChatClick: TMenuItem
+        Caption = '&Chat'
+        OnClick = miAIChatClick
+      end
+      object NAI1: TMenuItem
+        Caption = '-'
+      end
+      object miLLMSettings: TMenuItem
+        Caption = 'LLM &Settings'
+        OnClick = miLLMSettingsClick
+      end
     end
     object miHelp: TMenuItem
       Caption = '&Help'

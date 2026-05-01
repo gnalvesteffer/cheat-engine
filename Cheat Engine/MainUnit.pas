@@ -21,7 +21,7 @@ uses
   , macport,LCLVersion, UTF8Process, macportdefines, fgl, networkInterfaceApi,
   networkInterface,
 
- LuaAI, frmAIChatUnit,
+   LuaAI, frmAIChatUnit, frmLLMSettingsUnit,
   betterControls;     //last one (darwin)
   {$endif}
 
@@ -46,7 +46,7 @@ uses
   groupscancommandparser, GraphType, IntfGraphics, RemoteMemoryManager,
   DBK64SecondaryLoader, savedscanhandler, debuggertypedefinitions, networkInterface,
   FrmMemoryRecordDropdownSettingsUnit, xmlutils, zstream, zstreamext, commonTypeDefs,
-VirtualQueryExCache, LazLogger, LazUTF8, LCLVersion, fgl, LuaAI, frmAIChatUnit, betterControls;
+VirtualQueryExCache, LazLogger, LazUTF8, LCLVersion, fgl, LuaAI, frmAIChatUnit, frmLLMSettingsUnit, betterControls;
   {$endif}
 //the following are just for compatibility
 
@@ -609,6 +609,7 @@ type
     procedure miFoundListPreferencesClick(Sender: TObject);
     procedure miAutoAssembleErrorMessageClick(Sender: TObject);
     procedure miAIChatClick(Sender: TObject);
+    procedure miLLMSettingsClick(Sender: TObject);
     procedure miHelpClick(Sender: TObject);
     procedure miLuaDocumentationClick(Sender: TObject);
     procedure miForgotScanClick(Sender: TObject);
@@ -3948,6 +3949,21 @@ begin
     frmAIChat := TfrmAIChat.Create(Application);
   frmAIChat.Show;
   frmAIChat.BringToFront;
+end;
+
+procedure TMainForm.miLLMSettingsClick(Sender: TObject);
+var
+  frm: TLLMSettingsForm;
+begin
+  frm := CreateLLMSettingsForm;
+  try
+    if frm.ShowModal = mrOk then
+    begin
+      { Settings applied and saved in btnOKClick }
+    end;
+  finally
+    frm.Free;
+  end;
 end;
 
 procedure TMainForm.miHelpClick(Sender: TObject);

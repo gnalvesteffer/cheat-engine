@@ -1,0 +1,1022 @@
+${mode delphi}
+
+unit LuaAI;
+
+{AI debugging co-pilot Lua module
+ Exposes functions to gather debugging context and interact with AI APIs.
+ Functions:
+   ai_readMemory(addr, size) -> string (hex bytes)
+   ai_getRegisters() -> table of register name/value pairs
+   ai_getCurrentRegister() -> {name, value, description}
+   ai_disassemble(addr, count) -> array of disasm strings
+   ai_getThreadInfo() -> table of thread info
+   ai_getBreakpoints() -> table of breakpoint info
+   ai_getModuleList() -> table of module info
+   ai_getStackTrace() -> array of stack frame strings
+   ai_getProcessInfo() -> {pid, name, architecture, bits}
+   ai_findPointer(address) -> table of pointer paths
+   ai_getMemorySections() -> table of memory regions
+   ai_gatherContext() -> comprehensive debug context string
+   ai_call(url, body) -> string (HTTP POST response)
+   ai_setKey(key) -> nil (set API key in settings)
+   ai_getKey() -> string
+   ai_chat(message) -> string (conversational AI response)
+   ai_chatStream(message) -> callback-based streaming
+}
+
+interface
+
+uses
+  Classes, SysUtils, lua, lauxlib, lualib;
+
+procedure initializeLuaAI;
+
+implementation
+
+uses
+  debughelper, ProcessHandlerUnit,
+  commontypedefs, NewKernelHandler, disassembler, symbolhandler,
+  globals, debugeventhandler, breakpointtypedef,
+  stacktrace2, LuaInternet, rescanhelper,
+  LCLProc, Windows, CEFuncProc, dialogs, JSONFunctions,
+  contexthandler, LazUTF8;
+
+{-----------------------------------------------}
+{ Helper: safe string to Lua }
+{-----------------------------------------------}
+
+function safePushString(L: Plua_State; const s: string): integer;
+begin
+  if s = '' then
+    lua_pushnil(L)
+  else
+    lua_pushstring(L, PChar(s));
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ Helper: get current debug context + handler }
+{-----------------------------------------------}
+
+function getCurrentContext: pointer;
+begin
+  Result := nil;
+  if (debuggerthread <> nil) and (debuggerthread.currentThread <> nil) then
+    Result := debuggerthread.currentThread.context;
+end;
+
+function getContextHandler: TContextInfo;
+begin
+  Result := getBestContextHandler;
+end;
+
+{-----------------------------------------------}
+{ ai_readMemory - Read memory at address }
+{-----------------------------------------------}
+
+function ai_readMemory(L: Plua_State): integer; cdecl;
+var
+  addr: ptruint;
+  size: integer;
+  buf: array of byte;
+  s: string;
+  i: integer;
+  actualread: SIZE_T;
+begin
+  Result := 0;
+  try
+    if lua_gettop(L) < 2 then
+    begin
+      lua_pushstring(L, 'Usage: ai_readMemory(address, size)');
+      Exit;
+    end;
+
+    addr := lua_tounsignedinteger(L, 1);
+    size := lua_tointeger(L, 2);
+
+    if size < 1 then size := 1;
+    if size > 4096 then size := 4096;
+
+    SetLength(buf, size);
+    actualread := 0;
+    if ReadProcessMemory(processhandle, pointer(addr), @buf[0], size, actualread) then
+    begin
+      s := '';
+      for i := 0 to size - 1 do
+        s := s + Format('%02X ', [buf[i]]);
+      lua_pushstring(L, PChar(TrimRight(s)));
+    end
+    else
+      lua_pushstring(L, '');
+
+  except
+    lua_pushstring(L, '');
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getRegisters - Get all register values }
+{-----------------------------------------------}
+
+function ai_getRegisters(L: Plua_State): integer; cdecl;
+var
+  ctx: pointer;
+  ch: TContextInfo;
+  gpr: PContextElementRegisterList;
+  i: integer;
+begin
+  Result := 0;
+  try
+    ctx := getCurrentContext;
+    if ctx = nil then
+    begin
+      lua_pushstring(L, 'No debug context available. Attach to a process first.');
+      Exit;
+    end;
+
+    ch := getContextHandler;
+    if ch = nil then
+    begin
+      lua_pushstring(L, 'Context handler not available.');
+      Exit;
+    end;
+
+    gpr := ch.getGeneralPurposeRegisters;
+
+    lua_newtable(L);
+    for i := 0 to gpr^.count - 1 do
+    begin
+      lua_pushstring(L, PChar(gpr^[i].name));
+      lua_pushinteger(L, gpr^[i].getValue(ctx));
+      lua_settable(L, -3);
+    end;
+
+    lua_pushstring(L, 'architecture');
+    if processhandler.is64bit then
+      lua_pushstring(L, 'x64')
+    else
+      lua_pushstring(L, 'x86');
+    lua_settable(L, -3);
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getCurrentRegister - Get RIP/EIP info }
+{-----------------------------------------------}
+
+function ai_getCurrentRegister(L: Plua_State): integer; cdecl;
+var
+  ctx: pointer;
+  ch: TContextInfo;
+  ipReg: PContextElement_register;
+  ipAddr: ptruint;
+  d: TDisassembler;
+  desc: string;
+begin
+  Result := 0;
+  try
+    ctx := getCurrentContext;
+    if ctx = nil then
+    begin
+      lua_pushstring(L, 'No debug context. Attach to a process first.');
+      Exit;
+    end;
+
+    ch := getContextHandler;
+    if ch = nil then
+    begin
+      lua_pushstring(L, 'Context handler not available.');
+      Exit;
+    end;
+
+    ipReg := ch.InstructionPointerRegister;
+    if ipReg = nil then
+    begin
+      lua_pushstring(L, 'Instruction pointer register not available.');
+      Exit;
+    end;
+
+    ipAddr := ipReg.getValue(ctx);
+
+    d := TDisassembler.Create;
+    try
+      d.setProcessHandler(processhandler);
+      desc := d.disassemble(ipAddr);
+    finally
+      d.Free;
+    end;
+
+    lua_newtable(L);
+    lua_pushstring(L, 'name');
+    lua_pushstring(L, PChar(ipReg.name));
+    lua_settable(L, -3);
+
+    lua_pushstring(L, 'value');
+    lua_pushinteger(L, ipAddr);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, 'disassembly');
+    lua_pushstring(L, PChar(desc));
+    lua_settable(L, -3);
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_disassemble - Disassemble at address }
+{-----------------------------------------------}
+
+function ai_disassemble(L: Plua_State): integer; cdecl;
+var
+  addr: ptruint;
+  count: integer;
+  d: TDisassembler;
+  desc: string;
+  i: integer;
+begin
+  Result := 0;
+  try
+    if lua_gettop(L) < 1 then
+    begin
+      lua_pushstring(L, 'Usage: ai_disassemble(address [, count])');
+      Exit;
+    end;
+
+    addr := lua_tounsignedinteger(L, 1);
+    count := 5;
+    if lua_gettop(L) >= 2 then
+      count := lua_tointeger(L, 2);
+
+    if count < 1 then count := 1;
+    if count > 100 then count := 100;
+
+    d := TDisassembler.Create;
+    try
+      d.setProcessHandler(processhandler);
+      lua_newtable(L);
+      for i := 1 to count do
+      begin
+        desc := d.disassemble(addr);
+        lua_pushinteger(L, i);
+        lua_pushstring(L, PChar(desc));
+        lua_settable(L, -3);
+      end;
+    finally
+      d.Free;
+    end;
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getThreadInfo - Get thread info }
+{-----------------------------------------------}
+
+function ai_getThreadInfo(L: Plua_State): integer; cdecl;
+var
+  threadlist: TDwordArray;
+  i: integer;
+  thread: TDebugThreadHandler;
+begin
+  Result := 0;
+  try
+    if (debuggerthread = nil) or (processhandler.pid = 0) then
+    begin
+      lua_pushstring(L, 'No process attached.');
+      Exit;
+    end;
+
+    getThreadList(threadlist);
+
+    lua_newtable(L);
+    for i := 0 to length(threadlist) - 1 do
+    begin
+      thread := debuggerthread.getDebugThreadHanderFromThreadID(threadlist[i]);
+      if thread <> nil then
+      begin
+        lua_pushinteger(L, i + 1);
+        lua_newtable(L);
+
+        lua_pushstring(L, 'threadid');
+        lua_pushinteger(L, thread.ThreadId);
+        lua_settable(L, -3);
+
+        lua_pushstring(L, 'isSuspended');
+        lua_pushboolean(L, thread.isSuspended);
+        lua_settable(L, -3);
+
+        lua_pushstring(L, 'isWaitingToContinue');
+        lua_pushboolean(L, thread.isWaitingToContinue);
+        lua_settable(L, -3);
+
+        lua_pushstring(L, 'isHandled');
+        lua_pushboolean(L, thread.isHandled);
+        lua_settable(L, -3);
+
+        lua_settable(L, -3);
+      end;
+    end;
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getBreakpoints - Get all breakpoints }
+{-----------------------------------------------}
+
+function ai_getBreakpoints(L: Plua_State): integer; cdecl;
+var
+  addrs: TAddressArray;
+  i: integer;
+  bp: PBreakpoint;
+begin
+  Result := 0;
+  try
+    if debuggerthread = nil then
+    begin
+      lua_pushstring(L, 'Debugger not available.');
+      Exit;
+    end;
+
+    debuggerthread.getBreakpointAddresses(addrs);
+
+    lua_newtable(L);
+    for i := 0 to length(addrs) - 1 do
+    begin
+      bp := debuggerthread.isBreakpoint(addrs[i], 0, True);
+      if bp <> nil then
+      begin
+        lua_pushinteger(L, i + 1);
+        lua_newtable(L);
+
+        lua_pushstring(L, 'address');
+        lua_pushinteger(L, bp.address);
+        lua_settable(L, -3);
+
+        lua_pushstring(L, 'active');
+        lua_pushboolean(L, bp.active);
+        lua_settable(L, -3);
+
+        lua_pushstring(L, 'size');
+        lua_pushinteger(L, bp.size);
+        lua_settable(L, -3);
+
+        lua_pushstring(L, 'method');
+        case bp.breakpointMethod of
+          bpmSoftware: lua_pushstring(L, 'software');
+          bpmHardware: lua_pushstring(L, 'hardware');
+          bpmDebugRegister: lua_pushstring(L, 'debugRegister');
+          bpmDBVM: lua_pushstring(L, 'DBVM');
+          bpmPageProtect: lua_pushstring(L, 'pageProtect');
+          bpmException: lua_pushstring(L, 'exception');
+          bpmGDB: lua_pushstring(L, 'GDB');
+        else
+          lua_pushstring(L, 'unknown');
+        end;
+        lua_settable(L, -3);
+
+        lua_pushstring(L, 'trigger');
+        case bp.breakpointTrigger of
+          bptOnExecute: lua_pushstring(L, 'execute');
+          bptOnAccess: lua_pushstring(L, 'access');
+          bptOnWrite: lua_pushstring(L, 'write');
+          bptOnRead: lua_pushstring(L, 'read');
+          bptOnReadOrWrite: lua_pushstring(L, 'readWrite');
+          bptOnException: lua_pushstring(L, 'exception');
+          bptOnModuleLoad: lua_pushstring(L, 'moduleLoad');
+          bptOnThreadCreate: lua_pushstring(L, 'threadCreate');
+          bptOnThreadExit: lua_pushstring(L, 'threadExit');
+          bptOnProcessCreate: lua_pushstring(L, 'processCreate');
+          bptOnProcessExit: lua_pushstring(L, 'processExit');
+          bptOnUnhandledException: lua_pushstring(L, 'unhandledException');
+        else
+          lua_pushstring(L, 'unknown');
+        end;
+        lua_settable(L, -3);
+
+        lua_settable(L, -3);
+      end;
+    end;
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getModuleList - Get loaded modules }
+{-----------------------------------------------}
+
+function ai_getModuleList(L: Plua_State): integer; cdecl;
+var
+  i: integer;
+  name: string;
+  base, sz: ptruint;
+begin
+  Result := 0;
+  try
+    if processhandler.pid = 0 then
+    begin
+      lua_pushstring(L, 'No process attached.');
+      Exit;
+    end;
+
+    symhandler.initmoduleinformation;
+
+    lua_newtable(L);
+    for i := 0 to symhandler.moduleList.Count - 1 do
+    begin
+      lua_pushinteger(L, i + 1);
+      lua_newtable(L);
+
+      symhandler.getModuleInformation(i, name, base, sz);
+
+      lua_pushstring(L, 'name');
+      lua_pushstring(L, PChar(name));
+      lua_settable(L, -3);
+
+      lua_pushstring(L, 'base');
+      lua_pushinteger(L, base);
+      lua_settable(L, -3);
+
+      lua_pushstring(L, 'size');
+      lua_pushinteger(L, sz);
+      lua_settable(L, -3);
+
+      lua_settable(L, -3);
+    end;
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getStackTrace - Get stack trace }
+{-----------------------------------------------}
+
+function ai_getStackTrace(L: Plua_State): integer; cdecl;
+var
+  ctx: pointer;
+begin
+  Result := 0;
+  try
+    ctx := getCurrentContext;
+    if ctx = nil then
+    begin
+      lua_pushstring(L, 'No debug context. Attach to a process first.');
+      Exit;
+    end;
+
+    ce_stacktrace(L, ctx, processhandler, nil);
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getProcessInfo - Get process info }
+{-----------------------------------------------}
+
+function ai_getProcessInfo(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  try
+    lua_newtable(L);
+
+    lua_pushstring(L, 'pid');
+    lua_pushinteger(L, processhandler.pid);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, 'name');
+    lua_pushstring(L, PChar(processhandler.Processname));
+    lua_settable(L, -3);
+
+    lua_pushstring(L, 'architecture');
+    if processhandler.is64bit then
+      lua_pushstring(L, 'x64')
+    else
+      lua_pushstring(L, 'x86');
+    lua_settable(L, -3);
+
+    lua_pushstring(L, 'bits');
+    if processhandler.is64bit then
+      lua_pushinteger(L, 64)
+    else
+      lua_pushinteger(L, 32);
+    lua_settable(L, -3);
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_findPointer - Find pointer path to address }
+{-----------------------------------------------}
+
+function ai_findPointer(L: Plua_State): integer; cdecl;
+var
+  addr: ptruint;
+  helper: TRescanHelper;
+  maxDepth: integer;
+begin
+  Result := 0;
+  try
+    if lua_gettop(L) < 1 then
+    begin
+      lua_pushstring(L, 'Usage: ai_findPointer(address, [maxdepth=4])');
+      Exit;
+    end;
+
+    addr := lua_tounsignedinteger(L, 1);
+    maxDepth := 4;
+    if lua_gettop(L) >= 2 then
+      maxDepth := lua_tointeger(L, 2);
+    if (maxDepth < 1) or (maxDepth > 8) then maxDepth := 4;
+
+    helper := TRescanHelper.Create(nil);
+    try
+      helper.addScanEntry(addr, svtInteger, '4', '0', False, False, False);
+      helper.setMaxDepth(maxDepth);
+      helper.setFoundList(nil);
+      helper.performScan;
+      lua_pushboolean(L, helper.found);
+    finally
+      helper.Free;
+    end;
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_getMemorySections - Get memory regions }
+{-----------------------------------------------}
+
+function ai_getMemorySections(L: Plua_State): integer; cdecl;
+var
+  regions: TStringList;
+  region: TMemoryRegionInformation;
+  i: integer;
+  addr: ptruint;
+  protection: dword;
+  regionType: integer;
+begin
+  Result := 0;
+  try
+    if processhandler.pid = 0 then
+    begin
+      lua_pushstring(L, 'No process attached.');
+      Exit;
+    end;
+
+    lua_newtable(L);
+    addr := 0;
+    while true do
+    begin
+      region := getMemoryRegionInformation(addr, True);
+      if region.address = 0 then Break;
+
+      lua_pushinteger(L, lua_gettable(L, -1) + 1);
+      lua_newtable(L);
+
+      lua_pushstring(L, 'start');
+      lua_pushinteger(L, region.address);
+      lua_settable(L, -3);
+
+      lua_pushstring(L, 'size');
+      lua_pushinteger(L, region.regionSize);
+      lua_settable(L, -3);
+
+      lua_pushstring(L, 'protection');
+      lua_pushinteger(L, region.protection);
+      lua_settable(L, -3);
+
+      lua_settable(L, -3);
+      addr := region.address + region.regionSize;
+    end;
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ buildContextString - Helper for AI context }
+{-----------------------------------------------}
+
+function buildContextString: string;
+var
+  ctx: pointer;
+  ch: TContextInfo;
+  ipReg: PContextElement_register;
+  ipAddr: ptruint;
+  d: TDisassembler;
+  regs, disasm, bpStr, modStr: string;
+  i: integer;
+  gpr: PContextElementRegisterList;
+  addrs: TAddressArray;
+  bp: PBreakpoint;
+  modName: string;
+  modBase, modSize: ptruint;
+  archStr: string;
+begin
+  Result := '';
+  regs := '';
+  disasm := '';
+  bpStr := '';
+  modStr := '';
+
+  archStr := 'x86';
+  if processhandler.is64bit then archStr := 'x64';
+
+  ctx := getCurrentContext;
+  if ctx <> nil then
+  begin
+    ch := getContextHandler;
+    if ch <> nil then
+    begin
+      { Registers }
+      gpr := ch.getGeneralPurposeRegisters;
+      for i := 0 to gpr^.count - 1 do
+        regs := regs + Format('  %s: 0x%s%s', [gpr^[i].name, IntToHex(gpr^[i].getValue(ctx), 1), #13#10]);
+
+      { Instruction pointer + disassembly }
+      ipReg := ch.InstructionPointerRegister;
+      if ipReg <> nil then
+      begin
+        ipAddr := ipReg.getValue(ctx);
+        d := TDisassembler.Create;
+        try
+          d.setProcessHandler(processhandler);
+          disasm := '  ' + ipReg.name + ': 0x' + IntToHex(ipAddr, 1) + ' -> ' + d.disassemble(ipAddr) + #13#10;
+        finally
+          d.Free;
+        end;
+      end;
+    end;
+  end;
+
+  { Breakpoints }
+  if (debuggerthread <> nil) then
+  begin
+    debuggerthread.getBreakpointAddresses(addrs);
+    for i := 0 to length(addrs) - 1 do
+    begin
+      bp := debuggerthread.isBreakpoint(addrs[i], 0, True);
+      if bp <> nil then
+        bpStr := bpStr + Format('  0x%s active=%s%s', [IntToHex(bp.address, 1), BoolToStr(bp.active, True), #13#10]);
+    end;
+    if bpStr = '' then
+      bpStr := '  (none)' + #13#10;
+  end;
+
+  { Modules - main module + first 5 }
+  if processhandler.pid <> 0 then
+  begin
+    symhandler.initmoduleinformation;
+    for i := 0 to symhandler.moduleList.Count - 1 do
+    begin
+      symhandler.getModuleInformation(i, modName, modBase, modSize);
+      modStr := modStr + Format('  %s: 0x%s (%s bytes)%s', [modName, IntToHex(modBase, 1), IntToStr(modSize), #13#10]);
+    end;
+  end;
+
+  Result := Format(
+    '=== Process ===%s' +
+    '  PID: %s%s' +
+    '  Name: %s%s' +
+    '  Arch: %s%s' +
+    '  State: %s%s' +
+    '=== Registers ===%s' +
+    '%s' +
+    '=== Disassembly ===%s' +
+    '%s' +
+    '=== Breakpoints ===%s' +
+    '%s' +
+    '=== Modules ===%s' +
+    '%s',
+    [#13#10, IntToStr(processhandler.pid), #13#10,
+     processhandler.Processname, #13#10,
+     archStr, #13#10,
+     BoolToStr(debuggerthread <> nil, 'debugged', 'running'), #13#10,
+     #13#10, regs, #13#10, disasm, #13#10, bpStr, #13#10, modStr]
+  );
+end;
+
+{-----------------------------------------------}
+{ ai_gatherContext - Comprehensive context string }
+{-----------------------------------------------}
+
+function ai_gatherContext(L: Plua_State): integer; cdecl;
+var
+  contextStr: string;
+begin
+  Result := 0;
+  try
+    contextStr := buildContextString;
+    lua_pushstring(L, PChar(contextStr));
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_call - HTTP POST call to AI API }
+{-----------------------------------------------}
+
+function ai_call(L: Plua_State): integer; cdecl;
+var
+  url, body: string;
+  response: string;
+  http: TLuaInternet;
+  headers: TStringList;
+begin
+  Result := 0;
+  try
+    if lua_gettop(L) < 2 then
+    begin
+      lua_pushstring(L, 'Usage: ai_call(url, body)');
+      Exit;
+    end;
+
+    url := Lua_ToString(L, 1);
+    body := Lua_ToString(L, 2);
+
+    http := TLuaInternet.Create(nil);
+    try
+      headers := TStringList.Create;
+      try
+        headers.Add('Content-Type: application/json');
+        response := http.post(url, body, headers);
+        lua_pushstring(L, PChar(response));
+      finally
+        headers.Free;
+      end;
+    finally
+      http.Free;
+    end;
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_setKey / ai_getKey - API key management }
+{-----------------------------------------------}
+
+var
+  g_aiKey: string = '';
+  g_aiBaseUrl: string = 'https://api.openai.com/v1/chat/completions';
+  g_aiModel: string = 'gpt-4o-mini';
+
+function ai_setKey(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  if lua_gettop(L) >= 1 then
+    g_aiKey := Lua_ToString(L, 1);
+end;
+
+function ai_setBaseUrl(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  if lua_gettop(L) >= 1 then
+    g_aiBaseUrl := Lua_ToString(L, 1);
+end;
+
+function ai_setModel(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  if lua_gettop(L) >= 1 then
+    g_aiModel := Lua_ToString(L, 1);
+end;
+
+function ai_getKey(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  if g_aiKey = '' then
+    lua_pushnil(L)
+  else
+    lua_pushstring(L, PChar(g_aiKey));
+  Result := 1;
+end;
+
+function ai_getBaseUrl(L: Plua_State): integer; cdecl;
+begin
+  Result := 0;
+  lua_pushstring(L, PChar(g_aiBaseUrl));
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_chat - Conversational AI (sends context + message) }
+{-----------------------------------------------}
+
+function ai_chat(L: Plua_State): integer; cdecl;
+var
+  message: string;
+  contextStr: string;
+  jsonBody: string;
+  response: string;
+  http: TLuaInternet;
+  headers: TStringList;
+  systemPrompt: string;
+begin
+  Result := 0;
+  try
+    if lua_gettop(L) < 1 then
+    begin
+      lua_pushstring(L, 'Usage: ai_chat(message)');
+      Exit;
+    end;
+
+    if g_aiKey = '' then
+    begin
+      lua_pushstring(L, 'No API key set. Use ai_setKey("your-key") first.');
+      Exit;
+    end;
+
+    message := Lua_ToString(L, 1);
+    contextStr := buildContextString;
+
+    systemPrompt := 'You are an expert reverse engineering assistant embedded in Cheat Engine. ' +
+      'You help analyze debugged processes, disassembly, and memory. ' +
+      'The current debug context is: ' + #13#10 + #13#10 +
+      contextStr + #13#10 +
+      'Be concise and technical. Use hex addresses where relevant. ' +
+      'If the user asks about code, explain what it does in plain terms.';
+
+    jsonBody := Format(
+      '{"model":"%s","temperature":0.2,"max_tokens":2048,"messages":[{"role":"system","content":%s},{"role":"user","content":%s}]}',
+      [g_aiModel, AnsiQuotedStr(systemPrompt, '"'), AnsiQuotedStr(message, '"')]
+    );
+
+    http := TLuaInternet.Create(nil);
+    try
+      headers := TStringList.Create;
+      try
+        headers.Add('Authorization: Bearer ' + g_aiKey);
+        headers.Add('Content-Type: application/json');
+        response := http.post(g_aiBaseUrl, jsonBody, headers);
+      finally
+        headers.Free;
+      end;
+
+      if response <> '' then
+        lua_pushstring(L, PChar(response))
+      else
+        lua_pushstring(L, '(empty response)');
+    finally
+      http.Free;
+    end;
+
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 1;
+end;
+
+{-----------------------------------------------}
+{ ai_chatStream - Streaming chat via callback }
+{-----------------------------------------------}
+
+function ai_chatStream(L: Plua_State): integer; cdecl;
+var
+  message: string;
+  contextStr: string;
+  jsonBody: string;
+  systemPrompt: string;
+begin
+  Result := 0;
+  try
+    if lua_gettop(L) < 2 then
+    begin
+      lua_pushstring(L, 'Usage: ai_chatStream(message, callback)');
+      Exit;
+    end;
+
+    if g_aiKey = '' then
+    begin
+      lua_pushstring(L, 'No API key set. Use ai_setKey("your-key") first.');
+      Exit;
+    end;
+
+    message := Lua_ToString(L, 1);
+    contextStr := buildContextString;
+
+    systemPrompt := 'You are an expert reverse engineering assistant embedded in Cheat Engine. ' +
+      'Current debug context: ' + #13#10 + contextStr + #13#10 +
+      'Be concise and technical.';
+
+    jsonBody := Format(
+      '{"model":"%s","temperature":0.2,"max_tokens":2048,"stream":true,"messages":[{"role":"system","content":%s},{"role":"user","content":%s}]}',
+      [g_aiModel, AnsiQuotedStr(systemPrompt, '"'), AnsiQuotedStr(message, '"')]
+    );
+
+    { For streaming, we push the callback and body for the caller to process }
+    lua_pushstring(L, PChar(jsonBody));
+    lua_pushstring(L, PChar(g_aiBaseUrl));
+    lua_pushstring(L, PChar(g_aiKey));
+  except
+    on e: Exception do
+    begin
+      lua_pushstring(L, PChar('Error: ' + e.Message));
+    end;
+  end;
+  Result := 3;  { Returns jsonBody, baseUrl, apiKey for async processing }
+end;
+
+{-----------------------------------------------}
+{ registerLuaAI - Register all AI functions }
+{-----------------------------------------------}
+
+procedure initializeLuaAI;
+begin
+  lua_register(LuaVM, 'ai_readMemory', ai_readMemory);
+  lua_register(LuaVM, 'ai_getRegisters', ai_getRegisters);
+  lua_register(LuaVM, 'ai_getCurrentRegister', ai_getCurrentRegister);
+  lua_register(LuaVM, 'ai_disassemble', ai_disassemble);
+  lua_register(LuaVM, 'ai_getThreadInfo', ai_getThreadInfo);
+  lua_register(LuaVM, 'ai_getBreakpoints', ai_getBreakpoints);
+  lua_register(LuaVM, 'ai_getModuleList', ai_getModuleList);
+  lua_register(LuaVM, 'ai_getStackTrace', ai_getStackTrace);
+  lua_register(LuaVM, 'ai_getProcessInfo', ai_getProcessInfo);
+  lua_register(LuaVM, 'ai_findPointer', ai_findPointer);
+  lua_register(LuaVM, 'ai_getMemorySections', ai_getMemorySections);
+  lua_register(LuaVM, 'ai_gatherContext', ai_gatherContext);
+  lua_register(LuaVM, 'ai_call', ai_call);
+  lua_register(LuaVM, 'ai_setKey', ai_setKey);
+  lua_register(LuaVM, 'ai_getKey', ai_getKey);
+  lua_register(LuaVM, 'ai_setBaseUrl', ai_setBaseUrl);
+  lua_register(LuaVM, 'ai_getBaseUrl', ai_getBaseUrl);
+  lua_register(LuaVM, 'ai_setModel', ai_setModel);
+  lua_register(LuaVM, 'ai_chat', ai_chat);
+  lua_register(LuaVM, 'ai_chatStream', ai_chatStream);
+end;
+
+end.
