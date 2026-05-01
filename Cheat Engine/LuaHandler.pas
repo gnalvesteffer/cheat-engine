@@ -124,6 +124,7 @@ uses autoassembler, MainUnit, MainUnit2, LuaClass, frmluaengineunit, plugin, plu
   LuaPipeServer, LuaTreeview, LuaTreeNodes, LuaTreeNode, LuaCalendar, LuaSymbolListHandler,
   LuaCommonDialog, LuaFindDialog, LuaSettings, LuaPageControl, LuaStructureFrm,
   LuaInternet, SymbolListHandler, ProcessHandlerUnit, processlist,
+  LuaAI,
   DebuggerInterface, WindowsDebugger, VEHDebugger, KernelDebuggerInterface,
   DebuggerInterfaceAPIWrapper, Globals, math, speedhack2, CETranslator, binutils,
   xinput, winsapi, frmExeTrainerGeneratorUnit, CustomBase85, FileUtil, networkConfig,
@@ -17123,6 +17124,7 @@ begin
 
     initializeLuaStructureFrm;
     initializeLuaInternet;
+    initializeLuaAI;
     initializeLuaCustomType;
     initializeLuaSQL;
     {$IFDEF windows}

@@ -21,7 +21,8 @@ uses
   , macport,LCLVersion, UTF8Process, macportdefines, fgl, networkInterfaceApi,
   networkInterface,
 
-  betterControls;     //last one
+ LuaAI, frmAIChatUnit,
+  betterControls;     //last one (darwin)
   {$endif}
 
   {$ifdef windows}
@@ -45,7 +46,7 @@ uses
   groupscancommandparser, GraphType, IntfGraphics, RemoteMemoryManager,
   DBK64SecondaryLoader, savedscanhandler, debuggertypedefinitions, networkInterface,
   FrmMemoryRecordDropdownSettingsUnit, xmlutils, zstream, zstreamext, commonTypeDefs,
-  VirtualQueryExCache, LazLogger, LazUTF8, LCLVersion, fgl, betterControls;
+VirtualQueryExCache, LazLogger, LazUTF8, LCLVersion, fgl, LuaAI, frmAIChatUnit, betterControls;
   {$endif}
 //the following are just for compatibility
 
@@ -551,6 +552,7 @@ type
     MainMenu1: TMainMenu;
     File1: TMenuItem;
     Process1: TMenuItem;
+    miAIChat: TMenuItem;
     miHelp: TMenuItem;
     Edit3: TMenuItem;
     miAbout: TMenuItem;
@@ -606,6 +608,7 @@ type
     procedure miDeleteSavedScanResultsClick(Sender: TObject);
     procedure miFoundListPreferencesClick(Sender: TObject);
     procedure miAutoAssembleErrorMessageClick(Sender: TObject);
+    procedure miAIChatClick(Sender: TObject);
     procedure miHelpClick(Sender: TObject);
     procedure miLuaDocumentationClick(Sender: TObject);
     procedure miForgotScanClick(Sender: TObject);
@@ -1101,6 +1104,7 @@ type
 
 var
   MainForm: TMainForm;
+  frmAIChat: TfrmAIChat;
   ToggleWindows: TTogglewindows;
   AutoAttachThread: TAutoAttachThread;
 
@@ -3936,6 +3940,14 @@ procedure TMainForm.miAutoAssembleErrorMessageClick(Sender: TObject);
 begin
   clipboard.AsText:=miAutoAssembleErrorMessage.Caption;
   addresslist.doValueChange;
+end;
+
+procedure TMainForm.miAIChatClick(Sender: TObject);
+begin
+  if frmAIChat = nil then
+    frmAIChat := TfrmAIChat.Create(Application);
+  frmAIChat.Show;
+  frmAIChat.BringToFront;
 end;
 
 procedure TMainForm.miHelpClick(Sender: TObject);

@@ -100,7 +100,7 @@ uses
   Parsers, Globals, NullStream, RipRelativeScanner, LuaRIPRelativeScanner,
   VirtualQueryExCache, disassemblerthumb, AccessedMemory, LuaStructureFrm,
   MemoryQuery, pointerparser, GnuAssembler, binutils, dbvmLoadManual, mikmod,
-  frmEditHistoryUnit, LuaInternet, xinput, frmUltimap2Unit, cpuidunit, libipt,
+  frmEditHistoryUnit, LuaInternet, LuaAI, frmAIChatUnit, xinput, frmUltimap2Unit, cpuidunit, libipt,
   DPIHelper, Graphics, fontSaveLoadRegistry, registry, frmWatchlistUnit,
   frmWatchListAddEntryUnit, frmBusyUnit, FindDialogFix, LuaCustomType, LuaSQL,
   bCrypt, feces, askToRunLuaScript, frmDBVMWatchConfigUnit,

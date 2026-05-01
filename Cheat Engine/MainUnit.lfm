@@ -2648,6 +2648,10 @@ object MainForm: TMainForm
     object miLanguages: TMenuItem
       Caption = 'Languages'
     end
+    object miAIChat: TMenuItem
+      Caption = 'AI &Chat'
+      OnClick = miAIChatClick
+    end
     object miHelp: TMenuItem
       Caption = '&Help'
       OnClick = miHelpClick
