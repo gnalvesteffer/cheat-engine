@@ -122,12 +122,17 @@ begin
     Exit;
   end;
 
+  { Auto-append /chat/completions if URL looks like a base path }
+  if (Pos('/v1', LowerCase(testUrl)) > 0) and
+     (Pos('/chat/completions', LowerCase(testUrl)) = 0) then
+    testUrl := testUrl + '/chat/completions';
+
   updateStatus('Testing connection...', False);
   Application.ProcessMessages;
 
  http := TWinInternet.Create('');
   try
-    http.Header := 'Content-Type: application/json' + #13#10;
+   http.Header := 'Content-Type: application/json' + #13#10;
     if apiKey <> '' then
       http.Header := http.Header + 'Authorization: Bearer ' + apiKey + #13#10;
 
